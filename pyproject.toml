@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "RoomLightSoftware"
+version = "0.1.0"
+description = "Python 3 GUI software to control RoomLightControl LED strips"
+readme = "README.md"
+requires-python = ">=3.9"
+# tkinter ships with CPython's standard library — no extra dependencies needed.
+dependencies = []
+
+[project.scripts]
+roomlight = "roomlightsoftware.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
