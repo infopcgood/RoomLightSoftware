@@ -1,6 +1,7 @@
 """RoomLightSoftware — main application window."""
 
 import colorsys
+import ctypes
 import ipaddress
 import json
 import socket
@@ -60,11 +61,21 @@ class RoomLightApp(tk.Tk):
         self._live_volume_sensitivity_power = 0.65
         self._red_segment_weight = 1.4
         self._red_edge_ease_power = 1.35
-        self._fft_block_frames = 1024   # ~21 ms per capture at 48 kHz
+        self._timer_resolution_ms = 1
+        self._winmm = None
+        self._high_res_timer_enabled = False
+        self._enable_high_resolution_timer()
+        self._udp_max_payload_bytes = 8192
+        self._fft_block_frames = 256    # ~5 ms per capture at 48 kHz
+        self._fft_frame_ms = max(
+            self._live_volume_frame_ms,
+            int(round(1000 * self._fft_block_frames / self._live_volume_samplerate)),
+        )
         self._fft_window_size = 4096    # ~11.7 Hz frequency resolution at 48 kHz
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._close_app)
         self._build_ui()
+        self.after_idle(self._auto_restart_saved_modes)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -543,14 +554,20 @@ class RoomLightApp(tk.Tk):
             else (strip["ip"], int(strip["port"]))
         )
 
-        max_updates_per_packet = 120
+        # Keep packets in strict ascending LED order and fit within UDP payload budget.
+        max_updates_per_packet = max(1, (self._udp_max_payload_bytes - 1) // 5)
         with socket.socket(family, socket.SOCK_DGRAM) as udp_socket:
             for start_index in range(0, num_leds, max_updates_per_packet):
                 end_index = min(start_index + max_updates_per_packet, num_leds)
-                packet = bytearray(b"u")
-                for led_index in range(start_index, end_index):
-                    packet.extend(led_index.to_bytes(2, byteorder="big"))
-                    packet.extend((output_red, output_green, output_blue))
+                update_count = end_index - start_index
+                packet = bytearray(1 + update_count * 5)
+                packet[0] = ord("u")
+                for offset_index, led_index in enumerate(range(start_index, end_index)):
+                    offset = 1 + offset_index * 5
+                    packet[offset : offset + 2] = led_index.to_bytes(2, byteorder="big")
+                    packet[offset + 2 : offset + 5] = bytes(
+                        (output_red, output_green, output_blue)
+                    )
                 udp_socket.sendto(packet, target)
 
         return output_red, output_green, output_blue
@@ -573,15 +590,19 @@ class RoomLightApp(tk.Tk):
             else (strip["ip"], int(strip["port"]))
         )
 
-        max_updates_per_packet = 120
+        # Keep packets in strict ascending LED order and fit within UDP payload budget.
+        max_updates_per_packet = max(1, (self._udp_max_payload_bytes - 1) // 5)
         with socket.socket(family, socket.SOCK_DGRAM) as udp_socket:
             for start_index in range(0, num_leds, max_updates_per_packet):
                 end_index = min(start_index + max_updates_per_packet, num_leds)
-                packet = bytearray(b"u")
-                for led_index in range(start_index, end_index):
+                update_count = end_index - start_index
+                packet = bytearray(1 + update_count * 5)
+                packet[0] = ord("u")
+                for offset_index, led_index in enumerate(range(start_index, end_index)):
                     red, green, blue = self._enhance_color(*led_colors[led_index])
-                    packet.extend(led_index.to_bytes(2, byteorder="big"))
-                    packet.extend((red, green, blue))
+                    offset = 1 + offset_index * 5
+                    packet[offset : offset + 2] = led_index.to_bytes(2, byteorder="big")
+                    packet[offset + 2 : offset + 5] = bytes((red, green, blue))
                 udp_socket.sendto(packet, target)
 
     def _volume_zone_counts(self, num_leds):
@@ -662,12 +683,98 @@ class RoomLightApp(tk.Tk):
         strip["fft_held_until"] = []
         strip.pop("animation_started_at", None)
 
+    def _restart_strip_from_saved_mode(self, strip):
+        """Apply a strip's persisted mode and settings at startup."""
+        mode = str(strip.get("mode", "full_color"))
+
+        if mode == "full_color":
+            red, green, blue = strip.get("color", (255, 80, 0))
+            self._stop_strip_animation(strip)
+            self._send_full_color_update(strip, int(red), int(green), int(blue))
+            return True
+
+        if mode == "strobe":
+            self._start_strobe_animation(strip)
+            return strip.get("animation_job") is not None
+
+        if mode == "live_volume":
+            self._start_live_volume_animation(strip)
+            return strip.get("animation_job") is not None
+
+        if mode == "fft_spectrum":
+            self._start_fft_animation(strip)
+            return strip.get("animation_job") is not None
+
+        self._stop_strip_animation(strip)
+        return True
+
+    def _auto_restart_saved_modes(self):
+        """Automatically restart all strips with their persisted mode on launch."""
+        if not self._strips:
+            return
+
+        failed_starts = []
+        for strip in self._strips:
+            try:
+                started_ok = self._restart_strip_from_saved_mode(strip)
+            except (OSError, ValueError) as exc:
+                self._stop_strip_animation(strip)
+                failed_starts.append(
+                    f"{strip.get('name', 'Unnamed strip')} ({strip.get('mode', 'full_color')}): {exc}"
+                )
+                continue
+
+            if not started_ok:
+                failed_starts.append(
+                    f"{strip.get('name', 'Unnamed strip')} ({strip.get('mode', 'full_color')}): "
+                    "The mode did not start successfully."
+                )
+
+        if failed_starts:
+            preview_lines = failed_starts[:5]
+            if len(failed_starts) > 5:
+                preview_lines.append(f"... and {len(failed_starts) - 5} more.")
+            messagebox.showwarning(
+                "Auto-restart incomplete",
+                "Some strips could not be restarted automatically:\n\n" + "\n".join(preview_lines),
+                parent=self,
+            )
+
     def _close_app(self):
         """Stop active animations before closing the application."""
         for strip in self._strips:
             self._stop_strip_animation(strip)
         self._save_settings()
+        self._disable_high_resolution_timer()
         self.destroy()
+
+    def _enable_high_resolution_timer(self):
+        """Request 1 ms Windows timer granularity for smoother high-FPS animations."""
+        if not hasattr(ctypes, "WinDLL"):
+            return
+
+        try:
+            winmm = ctypes.WinDLL("winmm")
+            result = winmm.timeBeginPeriod(self._timer_resolution_ms)
+        except Exception:
+            return
+
+        if result == 0:
+            self._winmm = winmm
+            self._high_res_timer_enabled = True
+
+    def _disable_high_resolution_timer(self):
+        """Release the Windows high-resolution timer request if it was enabled."""
+        if not self._high_res_timer_enabled or self._winmm is None:
+            return
+
+        try:
+            self._winmm.timeEndPeriod(self._timer_resolution_ms)
+        except Exception:
+            pass
+
+        self._high_res_timer_enabled = False
+        self._winmm = None
 
     def _interpolate_oklab_color(self, start_color, end_color, progress):
         """Blend two RGB colors in OKLab for smoother perceptual transitions."""
@@ -970,6 +1077,38 @@ class RoomLightApp(tk.Tk):
 
         return levels
 
+    def _gaussian_blur_levels(self, levels, target_count):
+        """Apply a small 1D Gaussian-like blur across neighboring FFT bands."""
+        target_count = max(0, int(target_count))
+        if target_count == 0:
+            return []
+
+        normalized = [0.0] * target_count
+        for index in range(target_count):
+            if index < len(levels):
+                normalized[index] = min(1.0, max(0.0, float(levels[index])))
+
+        if target_count == 1:
+            return normalized
+
+        # Pascal row [1, 4, 6, 4, 1] approximates a Gaussian kernel (sigma ~1).
+        kernel = (1.0, 4.0, 6.0, 4.0, 1.0)
+        radius = 2
+        blurred = [0.0] * target_count
+
+        for index in range(target_count):
+            weighted_sum = 0.0
+            total_weight = 0.0
+            for kernel_offset, weight in enumerate(kernel):
+                sample_index = index + kernel_offset - radius
+                if 0 <= sample_index < target_count:
+                    weighted_sum += normalized[sample_index] * weight
+                    total_weight += weight
+
+            blurred[index] = weighted_sum / total_weight if total_weight > 0 else normalized[index]
+
+        return blurred
+
     def _speaker_fft_worker(self, strip, stop_event):
         """Capture speaker loopback, compute FFT, and store per-LED spectrum levels."""
         try:
@@ -1032,6 +1171,7 @@ class RoomLightApp(tk.Tk):
         color_high = tuple(strip.get("fft_color_high", (255, 0, 0)))
 
         raw_levels = strip.get("fft_levels") or []
+        blurred_levels = self._gaussian_blur_levels(raw_levels, fft_led_count)
 
         fft_smoothed = strip.get("fft_smoothed")
         if not isinstance(fft_smoothed, list) or len(fft_smoothed) != fft_led_count:
@@ -1056,7 +1196,7 @@ class RoomLightApp(tk.Tk):
                 led_colors.append((0, 0, 0))
                 continue
 
-            raw = raw_levels[i] if i < len(raw_levels) else 0.0
+            raw = blurred_levels[i]
 
             prev = fft_smoothed[i]
             smoothed = prev * 0.05 + raw * 0.95 if raw >= prev else prev * 0.3 + raw * 0.7
@@ -1092,7 +1232,7 @@ class RoomLightApp(tk.Tk):
             return
 
         strip["animation_job"] = self.after(
-            self._live_volume_frame_ms,
+            self._fft_frame_ms,
             lambda current_strip=strip: self._run_fft_animation(current_strip),
         )
 
