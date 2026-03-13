@@ -1,6 +1,6 @@
 """Entry point for RoomLightSoftware."""
 
-from src.app import RoomLightApp
+from app import RoomLightApp
 
 
 def main():

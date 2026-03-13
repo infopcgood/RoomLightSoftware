@@ -8,8 +8,10 @@ version = "0.1.0"
 description = "Python 3 GUI software to control RoomLightControl LED strips"
 readme = "README.md"
 requires-python = ">=3.9"
-# tkinter ships with CPython's standard library — no extra dependencies needed.
-dependencies = []
+# tkinter ships with CPython's standard library.
+dependencies = [
+	"soundcard>=0.4.3",
+]
 
 [project.scripts]
 roomlight = "roomlightsoftware.main:main"

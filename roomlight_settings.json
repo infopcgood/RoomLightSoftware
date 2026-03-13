@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "strips": [
+    {
+      "name": "MonitorSideStrip",
+      "ip": "192.168.1.153",
+      "port": "13245",
+      "num_leds": 281,
+      "data_pin": 4,
+      "mode": "fft_spectrum",
+      "color": [
+        255,
+        80,
+        0
+      ],
+      "strobe_points": [
+        [
+          255,
+          0,
+          0
+        ],
+        [
+          0,
+          255,
+          0
+        ],
+        [
+          0,
+          0,
+          255
+        ]
+      ],
+      "strobe_interval_ms": 3000,
+      "strobe_speed_leds": 12.0,
+      "live_volume_gain": 2.5,
+      "live_volume_led_count": 281,
+      "fft_led_count": 240,
+      "fft_color_low": [
+        0,
+        0,
+        0
+      ],
+      "fft_color_high": [
+        255,
+        128,
+        0
+      ],
+      "fft_sustain_ms": 155,
+      "fft_gain": 43.9
+    },
+    {
+      "name": "BedSideStrip",
+      "ip": "192.168.1.135",
+      "port": "13245",
+      "num_leds": 209,
+      "data_pin": 4,
+      "mode": "live_volume",
+      "color": [
+        255,
+        80,
+        0
+      ],
+      "strobe_points": [
+        [
+          255,
+          0,
+          0
+        ],
+        [
+          0,
+          255,
+          0
+        ],
+        [
+          0,
+          0,
+          255
+        ]
+      ],
+      "strobe_interval_ms": 3000,
+      "strobe_speed_leds": 12.0,
+      "live_volume_gain": 1.8,
+      "live_volume_led_count": 209,
+      "fft_led_count": 209,
+      "fft_color_low": [
+        0,
+        0,
+        255
+      ],
+      "fft_color_high": [
+        255,
+        0,
+        0
+      ],
+      "fft_sustain_ms": 0,
+      "fft_gain": 2.5
+    }
+  ]
+}
