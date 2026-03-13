@@ -4,6 +4,7 @@ import colorsys
 import ctypes
 import ipaddress
 import json
+import math
 import socket
 import threading
 import tkinter as tk
@@ -19,6 +20,14 @@ except ImportError:
     np = None
     sc = None
     sc_mediafoundation = None
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
 
 
 def _patch_soundcard_fromstring_binary_mode():
@@ -52,13 +61,18 @@ class RoomLightApp(tk.Tk):
         super().__init__()
         self.title("RoomLight Control")
         self.resizable(False, False)
+        self._tray_icon = None
+        self._tray_thread = None
+        self._is_in_tray = False
+        self._tray_available = pystray is not None and Image is not None and ImageDraw is not None
+        self._exit_requested = False
         self._strips = []  # list of {"name": str, "ip": str, "port": str, ...}
         self._settings_path = Path(__file__).resolve().parents[1] / "roomlight_settings.json"
         self._strobe_frame_ms = 20
         self._live_volume_frame_ms = 8  # 125 FPS target
         self._live_volume_samplerate = 48000
         self._live_volume_block_frames = 256  # ~188 captures/sec at 48 kHz
-        self._live_volume_sensitivity_power = 0.65
+        self._live_volume_log_scale = 20.0
         self._red_segment_weight = 1.4
         self._red_edge_ease_power = 1.35
         self._timer_resolution_ms = 1
@@ -73,7 +87,7 @@ class RoomLightApp(tk.Tk):
         )
         self._fft_window_size = 4096    # ~11.7 Hz frequency resolution at 48 kHz
         self._load_settings()
-        self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._build_ui()
         self.after_idle(self._auto_restart_saved_modes)
 
@@ -740,8 +754,101 @@ class RoomLightApp(tk.Tk):
                 parent=self,
             )
 
+    def _create_tray_icon_image(self):
+        """Build a simple in-memory tray icon image."""
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((6, 6, 58, 58), fill=(24, 24, 24, 255), outline=(255, 160, 20, 255), width=4)
+        draw.rectangle((22, 22, 42, 42), fill=(255, 140, 0, 255))
+        return image
+
+    def _start_tray_icon(self):
+        """Start the system tray icon and context menu if available."""
+        if not self._tray_available:
+            return
+        if self._tray_icon is not None:
+            return
+
+        tray_menu = pystray.Menu(
+            pystray.MenuItem("Show", self._on_tray_show, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self._on_tray_exit),
+        )
+        self._tray_icon = pystray.Icon(
+            "roomlight_control",
+            self._create_tray_icon_image(),
+            "RoomLight Control",
+            tray_menu,
+        )
+        self._tray_thread = threading.Thread(
+            target=self._tray_icon.run,
+            daemon=True,
+            name="roomlight-tray-icon",
+        )
+        self._tray_thread.start()
+
+    def _stop_tray_icon(self):
+        """Stop and clean up the tray icon thread if it is running."""
+        tray_icon = self._tray_icon
+        tray_thread = self._tray_thread
+
+        self._tray_icon = None
+        self._tray_thread = None
+        self._is_in_tray = False
+
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception:
+                pass
+
+        if (
+            tray_thread is not None
+            and tray_thread.is_alive()
+            and tray_thread is not threading.current_thread()
+        ):
+            tray_thread.join(timeout=1.5)
+
+    def _restore_from_tray(self):
+        """Restore the main window from tray."""
+        if self._exit_requested:
+            return
+
+        self._stop_tray_icon()
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+
+    def _on_tray_show(self, _icon=None, _item=None):
+        """Tray callback to restore the main window."""
+        self.after(0, self._restore_from_tray)
+
+    def _on_tray_exit(self, _icon=None, _item=None):
+        """Tray callback to fully exit the application."""
+        self.after(0, self._close_app)
+
+    def _on_window_close(self):
+        """Handle window-close action by minimizing to tray."""
+        if self._exit_requested:
+            self._close_app()
+            return
+
+        if not self._tray_available:
+            self._close_app()
+            return
+
+        self.withdraw()
+        self._is_in_tray = True
+        self._start_tray_icon()
+
     def _close_app(self):
         """Stop active animations before closing the application."""
+        if self._exit_requested and not self.winfo_exists():
+            return
+
+        self._exit_requested = True
+        self._stop_tray_icon()
         for strip in self._strips:
             self._stop_strip_animation(strip)
         self._save_settings()
@@ -980,8 +1087,10 @@ class RoomLightApp(tk.Tk):
             return
 
         target_level = min(1.0, max(0.0, float(strip.get("live_volume_level", 0.0))))
-        # Exponent < 1 boosts low-to-mid peaks for a more sensitive meter.
-        target_level = target_level ** self._live_volume_sensitivity_power
+        # Apply one logarithmic curve so low-level audio drives the gauge more strongly.
+        target_level = math.log1p(target_level * self._live_volume_log_scale) / math.log1p(
+            self._live_volume_log_scale
+        )
         smoothed_level = float(strip.get("live_volume_smoothed", 0.0))
         if target_level >= smoothed_level:
             smoothed_level = smoothed_level * 0.05 + target_level * 0.95
