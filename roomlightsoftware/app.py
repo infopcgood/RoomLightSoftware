@@ -86,6 +86,7 @@ class RoomLightApp(tk.Tk):
             int(round(1000 * self._fft_block_frames / self._live_volume_samplerate)),
         )
         self._fft_window_size = 4096    # ~11.7 Hz frequency resolution at 48 kHz
+        self._fft_bin_range_cache = {}
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._build_ui()
@@ -606,6 +607,7 @@ class RoomLightApp(tk.Tk):
 
         # Keep packets in strict ascending LED order and fit within UDP payload budget.
         max_updates_per_packet = max(1, (self._udp_max_payload_bytes - 1) // 5)
+        enhanced_color_cache = {}
         with socket.socket(family, socket.SOCK_DGRAM) as udp_socket:
             for start_index in range(0, num_leds, max_updates_per_packet):
                 end_index = min(start_index + max_updates_per_packet, num_leds)
@@ -613,7 +615,12 @@ class RoomLightApp(tk.Tk):
                 packet = bytearray(1 + update_count * 5)
                 packet[0] = ord("u")
                 for offset_index, led_index in enumerate(range(start_index, end_index)):
-                    red, green, blue = self._enhance_color(*led_colors[led_index])
+                    led_color = tuple(led_colors[led_index])
+                    enhanced = enhanced_color_cache.get(led_color)
+                    if enhanced is None:
+                        enhanced = self._enhance_color(*led_color)
+                        enhanced_color_cache[led_color] = enhanced
+                    red, green, blue = enhanced
                     offset = 1 + offset_index * 5
                     packet[offset : offset + 2] = led_index.to_bytes(2, byteorder="big")
                     packet[offset + 2 : offset + 5] = bytes((red, green, blue))
@@ -659,8 +666,11 @@ class RoomLightApp(tk.Tk):
 
         return led_colors
 
-    def _stop_strip_animation(self, strip):
-        """Cancel any scheduled animation callback for a strip."""
+    def _stop_strip_animation(self, strip, worker_join_timeout=1.5):
+        """Cancel active strip animation and request audio workers to stop.
+
+        Returns True if any active audio worker exits within `worker_join_timeout`.
+        """
         animation_job = strip.get("animation_job")
         if animation_job is not None:
             try:
@@ -672,10 +682,6 @@ class RoomLightApp(tk.Tk):
         if volume_stop_event is not None:
             volume_stop_event.set()
 
-        volume_worker = strip.get("volume_worker")
-        if volume_worker is not None and volume_worker.is_alive():
-            volume_worker.join(timeout=0.25)
-
         # Backward compatibility for older sessions that still had a stream object.
         volume_stream = strip.get("volume_stream")
         if volume_stream is not None:
@@ -685,9 +691,16 @@ class RoomLightApp(tk.Tk):
             except Exception:
                 pass
 
+        worker_stopped = True
+        volume_worker = strip.get("volume_worker")
+        if volume_worker is not None and volume_worker.is_alive():
+            volume_worker.join(timeout=max(0.0, float(worker_join_timeout)))
+            worker_stopped = not volume_worker.is_alive()
+
         strip["animation_job"] = None
-        strip["volume_stop_event"] = None
-        strip["volume_worker"] = None
+        if worker_stopped:
+            strip["volume_stop_event"] = None
+            strip["volume_worker"] = None
         strip["volume_stream"] = None
         strip["live_volume_error"] = None
         strip["fft_error"] = None
@@ -696,6 +709,7 @@ class RoomLightApp(tk.Tk):
         strip["fft_held_levels"] = []
         strip["fft_held_until"] = []
         strip.pop("animation_started_at", None)
+        return worker_stopped
 
     def _restart_strip_from_saved_mode(self, strip):
         """Apply a strip's persisted mode and settings at startup."""
@@ -842,6 +856,14 @@ class RoomLightApp(tk.Tk):
         self._is_in_tray = True
         self._start_tray_icon()
 
+    def _blackout_strip_on_exit(self, strip):
+        """Attempt to set a strip to black during shutdown without changing saved settings."""
+        try:
+            self._send_full_color_update(strip, 0, 0, 0)
+        except (OSError, ValueError):
+            # Ignore shutdown transmission failures and continue closing.
+            pass
+
     def _close_app(self):
         """Stop active animations before closing the application."""
         if self._exit_requested and not self.winfo_exists():
@@ -851,6 +873,7 @@ class RoomLightApp(tk.Tk):
         self._stop_tray_icon()
         for strip in self._strips:
             self._stop_strip_animation(strip)
+            self._blackout_strip_on_exit(strip)
         self._save_settings()
         self._disable_high_resolution_timer()
         self.destroy()
@@ -903,24 +926,34 @@ class RoomLightApp(tk.Tk):
         hue_distance_to_red = min(abs(hue), abs(1.0 - hue))
         return hue_distance_to_red <= 0.09 and saturation >= 0.25 and value >= 0.1
 
-    def _sample_loop_color_oklab(self, points, phase):
+    def _build_strobe_sampling_context(self, points):
+        """Precompute per-frame strobe data reused for every LED sample."""
+        segment_count = len(points)
+        red_flags = [self._is_red_region(point) for point in points]
+        oklab_points = [self._rgb_to_oklab(*point) for point in points]
+
+        segment_weights = []
+        for segment_index in range(segment_count):
+            start_is_red = red_flags[segment_index]
+            end_is_red = red_flags[(segment_index + 1) % segment_count]
+            weight = self._red_segment_weight if (start_is_red or end_is_red) else 1.0
+            segment_weights.append(weight)
+
+        return segment_weights, sum(segment_weights), red_flags, oklab_points
+
+    def _sample_loop_color_oklab(self, points, phase, sampling_context=None):
         """Sample a periodic color loop with explicit easing around red hues."""
         if not points:
             raise ValueError("No strobe color points are configured.")
         if len(points) == 1:
             return tuple(points[0])
 
+        if sampling_context is None:
+            sampling_context = self._build_strobe_sampling_context(points)
+        segment_weights, total_weight, red_flags, oklab_points = sampling_context
+
         phase = phase % 1.0
         segment_count = len(points)
-
-        segment_weights = []
-        for segment_index in range(segment_count):
-            start_is_red = self._is_red_region(points[segment_index])
-            end_is_red = self._is_red_region(points[(segment_index + 1) % segment_count])
-            weight = self._red_segment_weight if (start_is_red or end_is_red) else 1.0
-            segment_weights.append(weight)
-
-        total_weight = sum(segment_weights)
         weighted_phase = phase * total_weight
 
         segment_index = segment_count - 1
@@ -942,18 +975,19 @@ class RoomLightApp(tk.Tk):
         # Smoothstep easing removes abrupt velocity changes at point boundaries.
         eased_progress = segment_progress * segment_progress * (3 - 2 * segment_progress)
 
-        start_is_red = self._is_red_region(points[segment_index])
-        end_is_red = self._is_red_region(points[next_index])
+        start_is_red = red_flags[segment_index]
+        end_is_red = red_flags[next_index]
         if start_is_red and not end_is_red:
             eased_progress = eased_progress ** self._red_edge_ease_power
         elif end_is_red and not start_is_red:
             eased_progress = 1.0 - ((1.0 - eased_progress) ** self._red_edge_ease_power)
 
-        return self._interpolate_oklab_color(
-            points[segment_index],
-            points[next_index],
-            eased_progress,
-        )
+        start_lightness, start_green_red, start_blue_yellow = oklab_points[segment_index]
+        end_lightness, end_green_red, end_blue_yellow = oklab_points[next_index]
+        lightness = start_lightness + (end_lightness - start_lightness) * eased_progress
+        green_red = start_green_red + (end_green_red - start_green_red) * eased_progress
+        blue_yellow = start_blue_yellow + (end_blue_yellow - start_blue_yellow) * eased_progress
+        return self._oklab_to_rgb(lightness, green_red, blue_yellow)
 
     def _run_strobe_animation(self, strip):
         """Send the next frame for a strip running in strobe mode."""
@@ -970,16 +1004,27 @@ class RoomLightApp(tk.Tk):
         num_leds = strip["num_leds"]
         speed_leds = max(0.0, float(strip.get("strobe_speed_leds", 12.0)))
         base_phase = ((time.monotonic() - strip["animation_started_at"]) * 1000 / interval_ms) % 1.0
+        sampling_context = self._build_strobe_sampling_context(points)
 
         try:
             if speed_leds == 0:
-                red, green, blue = self._sample_loop_color_oklab(points, base_phase)
+                red, green, blue = self._sample_loop_color_oklab(
+                    points,
+                    base_phase,
+                    sampling_context,
+                )
                 self._send_full_color_update(strip, red, green, blue)
             else:
                 led_colors = []
                 for led_index in range(num_leds):
                     led_phase = base_phase - (led_index / speed_leds)
-                    led_colors.append(self._sample_loop_color_oklab(points, led_phase))
+                    led_colors.append(
+                        self._sample_loop_color_oklab(
+                            points,
+                            led_phase,
+                            sampling_context,
+                        )
+                    )
                 self._send_per_led_update(strip, led_colors)
         except (OSError, ValueError) as exc:
             self._stop_strip_animation(strip)
@@ -1005,7 +1050,8 @@ class RoomLightApp(tk.Tk):
         if not 250 <= interval_ms <= 60000:
             raise ValueError("Loop duration must be between 250 and 60000 milliseconds.")
 
-        self._stop_strip_animation(strip)
+        if not self._stop_strip_animation(strip):
+            raise OSError("Audio capture is still shutting down for this strip. Try again in a moment.")
         strip["animation_started_at"] = time.monotonic()
         self._run_strobe_animation(strip)
 
@@ -1132,7 +1178,8 @@ class RoomLightApp(tk.Tk):
         # Validate that loopback capture is available before starting the worker thread.
         self._get_default_speaker_loopback()
 
-        self._stop_strip_animation(strip)
+        if not self._stop_strip_animation(strip):
+            raise OSError("Audio capture is still shutting down for this strip. Try again in a moment.")
         strip["live_volume_level"] = 0.0
         strip["live_volume_smoothed"] = 0.0
         strip["live_volume_error"] = None
@@ -1155,33 +1202,64 @@ class RoomLightApp(tk.Tk):
     # FFT spectrum mode
     # ------------------------------------------------------------------
 
-    def _map_fft_to_leds(self, spectrum, fft_led_count, gain):
-        """Map an RFFT magnitude spectrum to per-LED levels on a log scale.
+    def _get_fft_bin_ranges(self, fft_led_count):
+        """Return cached FFT bin ranges for each LED band on a log scale."""
+        fft_led_count = max(1, int(fft_led_count))
+        cache_key = (
+            fft_led_count,
+            int(self._live_volume_samplerate),
+            int(self._fft_window_size),
+        )
+        cached_ranges = self._fft_bin_range_cache.get(cache_key)
+        if cached_ranges is not None:
+            return cached_ranges
 
-        Covers 10 Hz – 10 kHz log-evenly across `fft_led_count` LEDs.
-        Each LED's value is clamped to [0, 1] after the gain multiplier.
-        """
         freq_min = 10.0
         freq_max = 10000.0
-        full_fft_size = (len(spectrum) - 1) * 2
-        freq_resolution = self._live_volume_samplerate / full_fft_size
+        max_spectrum_bins = self._fft_window_size // 2 + 1
+        freq_resolution = self._live_volume_samplerate / self._fft_window_size
 
-        levels = []
-        for i in range(fft_led_count):
-            t_low = i / fft_led_count
-            t_high = (i + 1) / fft_led_count
+        fft_bin_ranges = []
+        for band_index in range(fft_led_count):
+            t_low = band_index / fft_led_count
+            t_high = (band_index + 1) / fft_led_count
             f_low = freq_min * (freq_max / freq_min) ** t_low
             f_high = freq_min * (freq_max / freq_min) ** t_high
 
             bin_low = max(0, int(f_low / freq_resolution))
-            bin_high = min(len(spectrum), int(f_high / freq_resolution) + 1)
-            if bin_low >= len(spectrum):
+            bin_high = min(max_spectrum_bins, int(f_high / freq_resolution) + 1)
+
+            if bin_low >= max_spectrum_bins:
+                bin_low = max_spectrum_bins - 1
+                bin_high = max_spectrum_bins
+            elif bin_low >= bin_high:
+                bin_high = min(max_spectrum_bins, bin_low + 1)
+
+            fft_bin_ranges.append((bin_low, bin_high))
+
+        self._fft_bin_range_cache[cache_key] = fft_bin_ranges
+        return fft_bin_ranges
+
+    def _map_fft_to_leds(self, spectrum, fft_bin_ranges, gain):
+        """Map an RFFT magnitude spectrum to per-LED levels using cached bin ranges.
+
+        Covers 10 Hz – 10 kHz log-evenly across the configured FFT LED bands.
+        Each LED's value is clamped to [0, 1] after the gain multiplier.
+        """
+        spectrum_magnitude = np.abs(spectrum)
+        spectrum_len = len(spectrum_magnitude)
+
+        levels = []
+        for bin_low, bin_high in fft_bin_ranges:
+            if bin_low >= spectrum_len:
                 levels.append(0.0)
                 continue
+            bin_high = min(spectrum_len, bin_high)
             if bin_low >= bin_high:
-                bin_high = bin_low + 1
+                levels.append(0.0)
+                continue
 
-            level = float(np.mean(np.abs(spectrum[bin_low:bin_high]))) * gain
+            level = float(np.mean(spectrum_magnitude[bin_low:bin_high])) * gain
             levels.append(min(1.0, max(0.0, level)))
 
         return levels
@@ -1225,6 +1303,7 @@ class RoomLightApp(tk.Tk):
             ring_buffer = np.zeros(self._fft_window_size, dtype=np.float32)
             window = np.hanning(self._fft_window_size).astype(np.float32)
             fft_led_count = int(strip.get("fft_led_count", strip["num_leds"]))
+            fft_bin_ranges = self._get_fft_bin_ranges(fft_led_count)
 
             with loopback.recorder(samplerate=self._live_volume_samplerate) as recorder:
                 while not stop_event.is_set():
@@ -1235,12 +1314,16 @@ class RoomLightApp(tk.Tk):
                         else block.astype(np.float32)
                     )
 
-                    ring_buffer = np.roll(ring_buffer, -self._fft_block_frames)
-                    ring_buffer[-self._fft_block_frames:] = mono[: self._fft_block_frames]
+                    # Shift the ring buffer in place to avoid per-frame array allocations.
+                    sample_count = min(self._fft_block_frames, len(mono))
+                    if sample_count <= 0:
+                        continue
+                    ring_buffer[:-sample_count] = ring_buffer[sample_count:]
+                    ring_buffer[-sample_count:] = mono[:sample_count]
 
                     spectrum = np.fft.rfft(ring_buffer * window) / self._fft_window_size
                     gain = float(strip.get("fft_gain", 2.5))
-                    strip["fft_levels"] = self._map_fft_to_leds(spectrum, fft_led_count, gain)
+                    strip["fft_levels"] = self._map_fft_to_leds(spectrum, fft_bin_ranges, gain)
         except Exception as exc:
             strip["fft_levels"] = [0.0] * int(strip.get("fft_led_count", strip["num_leds"]))
             strip["fft_error"] = str(exc)
@@ -1299,6 +1382,8 @@ class RoomLightApp(tk.Tk):
 
         now = time.monotonic()
         led_colors = []
+        low_l, low_a, low_b = self._rgb_to_oklab(*color_low)
+        high_l, high_a, high_b = self._rgb_to_oklab(*color_high)
 
         for i in range(total_leds):
             if i >= fft_led_count:
@@ -1321,7 +1406,10 @@ class RoomLightApp(tk.Tk):
 
             display_level = fft_held_levels[i]
 
-            base_r, base_g, base_b = self._interpolate_oklab_color(color_low, color_high, display_level)
+            lightness = low_l + (high_l - low_l) * display_level
+            green_red = low_a + (high_a - low_a) * display_level
+            blue_yellow = low_b + (high_b - low_b) * display_level
+            base_r, base_g, base_b = self._oklab_to_rgb(lightness, green_red, blue_yellow)
 
             led_colors.append((
                 int(round(base_r * display_level)),
@@ -1363,7 +1451,8 @@ class RoomLightApp(tk.Tk):
 
         self._get_default_speaker_loopback()
 
-        self._stop_strip_animation(strip)
+        if not self._stop_strip_animation(strip):
+            raise OSError("Audio capture is still shutting down for this strip. Try again in a moment.")
         strip["fft_levels"] = [0.0] * fft_led_count
         strip["fft_smoothed"] = [0.0] * fft_led_count
         strip["fft_held_levels"] = [0.0] * fft_led_count
@@ -2244,7 +2333,7 @@ class RoomLightApp(tk.Tk):
                 red = red_var.get()
                 green = green_var.get()
                 blue = blue_var.get()
-                self._stop_strip_animation(strip)
+                worker_stopped = self._stop_strip_animation(strip)
                 try:
                     output_red, output_green, output_blue = self._send_full_color_update(
                         strip,
@@ -2269,6 +2358,11 @@ class RoomLightApp(tk.Tk):
                 else:
                     status_var.set(
                         f"Applied {selected_hex} as {output_hex} to {strip['num_leds']} LEDs."
+                    )
+                if not worker_stopped:
+                    status_var.set(
+                        status_var.get()
+                        + " Audio capture is still shutting down for this strip."
                     )
                 self._save_settings()
                 return
